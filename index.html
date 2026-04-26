@@ -24,31 +24,337 @@
 <script>
 const STORAGE_KEY='notPaneli_v2';
 const SHEETS_URL='https://script.google.com/macros/s/AKfycbw76tAvjPoNEQnLqWfa4S3Po2FtRy6qrik2uNIMDNqglDx1AaKpzTf3SxJ3N2HUBp4pWQ/exec';
+const SYNC_INTERVAL_MS=45000;
+
+let autoSyncTimer=null;
+let autoSyncInFlight=false;
+let pendingAutoSync=false;
+let pollTimer=null;
 let state=loadState();
-function loadState(){const s=localStorage.getItem(STORAGE_KEY);if(s)return JSON.parse(s);return{todo:[],reminder:[],quick:[],notes:[]}}
-function saveState(){localStorage.setItem(STORAGE_KEY,JSON.stringify(state));render()}
-function uid(){return Date.now().toString(36)+Math.random().toString(36).slice(2)}
+
+function nowIso(){return new Date().toISOString()}
 function todayText(){return new Date().toLocaleDateString('tr-TR')}
+function uid(){return Date.now().toString(36)+Math.random().toString(36).slice(2)}
+function toMs(v){const t=Date.parse(v||'');return Number.isFinite(t)?t:0}
+function newestIso(a,b){return toMs(a)>=toMs(b)?(a||nowIso()):(b||nowIso())}
+
+function defaultState(){
+  return{todo:[],reminder:[],quick:[],notes:[],updatedAt:nowIso()}
+}
+
+function normalizeItem(type,item){
+  const normalized={...item};
+  normalized.id=String(normalized.id||uid());
+  normalized.text=String(normalized.text||'').trim();
+  if(type==='notes'){
+    normalized.meta='';
+    normalized.done=false;
+    normalized.doneAt='';
+  }else{
+    normalized.meta=String(normalized.meta||'Not');
+    normalized.done=Boolean(normalized.done);
+    normalized.doneAt=normalized.done?String(normalized.doneAt||todayText()):'';
+  }
+  normalized.deleted=Boolean(normalized.deleted);
+  normalized.createdAt=String(normalized.createdAt||todayText());
+  normalized.updatedAt=String(normalized.updatedAt||normalized.createdAt||nowIso());
+  return normalized;
+}
+
+function normalizeState(raw){
+  const base=defaultState();
+  const source=(raw&&typeof raw==='object')?raw:{};
+  base.todo=Array.isArray(source.todo)?source.todo.map(x=>normalizeItem('todo',x)).filter(x=>x.text):[];
+  base.reminder=Array.isArray(source.reminder)?source.reminder.map(x=>normalizeItem('reminder',x)).filter(x=>x.text):[];
+  base.quick=Array.isArray(source.quick)?source.quick.map(x=>normalizeItem('quick',x)).filter(x=>x.text):[];
+  base.notes=Array.isArray(source.notes)?source.notes.map(x=>normalizeItem('notes',x)).filter(x=>x.text):[];
+  base.updatedAt=String(source.updatedAt||latestStateTimestamp(base));
+  return base;
+}
+
+function latestStateTimestamp(s){
+  const all=[...(s.todo||[]),...(s.reminder||[]),...(s.quick||[]),...(s.notes||[])];
+  if(!all.length)return s.updatedAt||nowIso();
+  return all.reduce((acc,item)=>newestIso(acc,item.updatedAt),s.updatedAt||all[0].updatedAt||nowIso());
+}
+
+function loadState(){
+  try{
+    const raw=localStorage.getItem(STORAGE_KEY);
+    if(!raw)return defaultState();
+    return normalizeState(JSON.parse(raw));
+  }catch(e){
+    return defaultState();
+  }
+}
+
+function saveState(){
+  localStorage.setItem(STORAGE_KEY,JSON.stringify(state));
+  render();
+}
+
 function setStatus(text){document.getElementById('syncStatus').textContent=text}
-function addItem(type){const input=document.getElementById(type+'Input');const text=input.value.trim();if(!text)return;let meta='';if(type==='todo')meta=document.getElementById('todoPriority').value;if(type==='reminder')meta=document.getElementById('reminderDate').value||'Tarih yok';state[type].unshift({id:uid(),text,meta,done:false,createdAt:todayText(),doneAt:''});input.value='';if(type==='reminder')document.getElementById('reminderDate').value='';saveState()}
-function addQuick(){const input=document.getElementById('quickInput');const text=input.value.trim();if(!text)return;state.quick.unshift({id:uid(),text,meta:'Günlük kontrol',done:false,createdAt:todayText(),doneAt:''});input.value='';saveState()}
-function addNote(){const input=document.getElementById('noteInput');const text=input.value.trim();if(!text)return;state.notes.unshift({id:uid(),text,createdAt:todayText()});input.value='';saveState()}
+
+function updateStateTimestamp(){
+  state.updatedAt=nowIso();
+}
+
+function saveAndMaybeSync(shouldAutoSync){
+  updateStateTimestamp();
+  saveState();
+  if(shouldAutoSync)queueAutoSync();
+}
+
+function queueAutoSync(){
+  clearTimeout(autoSyncTimer);
+  autoSyncTimer=setTimeout(()=>{
+    syncToCloud({automatic:true});
+  },700);
+}
+
+function addItem(type){
+  const input=document.getElementById(type+'Input');
+  const text=input.value.trim();
+  if(!text)return;
+  let meta='';
+  if(type==='todo')meta=document.getElementById('todoPriority').value;
+  if(type==='reminder')meta=document.getElementById('reminderDate').value||'Tarih yok';
+  state[type].unshift({id:uid(),text,meta,done:false,createdAt:todayText(),doneAt:'',updatedAt:nowIso()});
+  input.value='';
+  if(type==='reminder')document.getElementById('reminderDate').value='';
+  saveAndMaybeSync(true);
+}
+
+function addQuick(){
+  const input=document.getElementById('quickInput');
+  const text=input.value.trim();
+  if(!text)return;
+  state.quick.unshift({id:uid(),text,meta:'Günlük kontrol',done:false,createdAt:todayText(),doneAt:'',updatedAt:nowIso()});
+  input.value='';
+  saveAndMaybeSync(true);
+}
+
+function addNote(){
+  const input=document.getElementById('noteInput');
+  const text=input.value.trim();
+  if(!text)return;
+  state.notes.unshift({id:uid(),text,createdAt:todayText(),updatedAt:nowIso()});
+  input.value='';
+  saveAndMaybeSync(true);
+}
+
 function clearNoteInput(){document.getElementById('noteInput').value=''}
-function toggleDone(type,id){const item=state[type].find(x=>x.id===id);if(!item)return;item.done=!item.done;item.doneAt=item.done?todayText():'';saveState()}
-function removeItem(type,id){state[type]=state[type].filter(x=>x.id!==id);saveState()}
-function editItem(type,id){const item=state[type].find(x=>x.id===id);if(!item)return;const t=prompt('Yeni metin:',item.text);if(t===null)return;item.text=t.trim()||item.text;saveState()}
-function removeNote(id){state.notes=state.notes.filter(x=>x.id!==id);saveState()}
-function editNote(id){const item=state.notes.find(x=>x.id===id);if(!item)return;const t=prompt('Yeni not:',item.text);if(t===null)return;item.text=t.trim()||item.text;saveState()}
-function escapeHtml(str){return String(str).replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;').replaceAll("'",'&#039;')}
-async function syncToCloud(){try{setStatus('Sheets’e kaydediliyor...');await fetch(SHEETS_URL,{method:'POST',mode:'no-cors',headers:{'Content-Type':'text/plain'},body:JSON.stringify({state,updatedAt:new Date().toISOString()})});setStatus('Sheets’e kaydedildi. Son kayıt: '+new Date().toLocaleString('tr-TR'))}catch(e){setStatus('Kayıt hatası: '+e.message)}}
-async function syncFromCloud(){try{setStatus('Sheets’ten yükleniyor...');const res=await fetch(SHEETS_URL+'?t='+Date.now());const data=await res.json();if(data&&data.state){state=data.state;saveState();setStatus('Sheets’ten yüklendi. Son yükleme: '+new Date().toLocaleString('tr-TR'))}else if(data&&Object.keys(data).length){state=data;saveState();setStatus('Sheets’ten yüklendi. Son yükleme: '+new Date().toLocaleString('tr-TR'))}else{setStatus('Sheets boş görünüyor. Önce bu cihazdan kaydet.')}}catch(e){setStatus('Yükleme hatası: '+e.message)}}
-function exportBackup(){const blob=new Blob([JSON.stringify({state,exportedAt:new Date().toISOString()},null,2)],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='not-paneli-yedek.json';a.click();URL.revokeObjectURL(a.href)}
+
+function toggleDone(type,id){
+  const item=state[type].find(x=>x.id===id);
+  if(!item)return;
+  item.done=!item.done;
+  item.doneAt=item.done?todayText():'';
+  item.updatedAt=nowIso();
+  saveAndMaybeSync(true);
+}
+
+function removeItem(type,id){
+  const item=state[type].find(x=>x.id===id);
+  if(!item)return;
+  item.deleted=true;
+  item.updatedAt=nowIso();
+  saveAndMaybeSync(true);
+}
+
+function editItem(type,id){
+  const item=state[type].find(x=>x.id===id);
+  if(!item)return;
+  const t=prompt('Yeni metin:',item.text);
+  if(t===null)return;
+  const trimmed=t.trim();
+  if(!trimmed)return;
+  item.text=trimmed;
+  item.updatedAt=nowIso();
+  saveAndMaybeSync(true);
+}
+
+function removeNote(id){
+  const item=state.notes.find(x=>x.id===id);
+  if(!item)return;
+  item.deleted=true;
+  item.updatedAt=nowIso();
+  saveAndMaybeSync(true);
+}
+
+function editNote(id){
+  const item=state.notes.find(x=>x.id===id);
+  if(!item)return;
+  const t=prompt('Yeni not:',item.text);
+  if(t===null)return;
+  const trimmed=t.trim();
+  if(!trimmed)return;
+  item.text=trimmed;
+  item.updatedAt=nowIso();
+  saveAndMaybeSync(true);
+}
+
+function escapeHtml(str){
+  return String(str).replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;').replaceAll("'",'&#039;');
+}
+
+function mergeItems(localItems,remoteItems,type){
+  const merged=new Map();
+  (localItems||[]).forEach(item=>{
+    const n=normalizeItem(type,item);
+    merged.set(n.id,n);
+  });
+  (remoteItems||[]).forEach(item=>{
+    const n=normalizeItem(type,item);
+    const existing=merged.get(n.id);
+    if(!existing){
+      merged.set(n.id,n);
+      return;
+    }
+    merged.set(n.id,toMs(n.updatedAt)>=toMs(existing.updatedAt)?n:existing);
+  });
+  return Array.from(merged.values()).sort((a,b)=>toMs(b.updatedAt)-toMs(a.updatedAt));
+}
+
+function mergeStates(localState,remoteState){
+  const local=normalizeState(localState);
+  const remote=normalizeState(remoteState);
+  const merged={
+    todo:mergeItems(local.todo,remote.todo,'todo'),
+    reminder:mergeItems(local.reminder,remote.reminder,'reminder'),
+    quick:mergeItems(local.quick,remote.quick,'quick'),
+    notes:mergeItems(local.notes,remote.notes,'notes'),
+    updatedAt:newestIso(local.updatedAt,remote.updatedAt)
+  };
+  merged.updatedAt=latestStateTimestamp(merged);
+  return merged;
+}
+
+async function syncToCloud(options={}){
+  const {automatic=false}=options;
+  if(autoSyncInFlight){
+    if(automatic)pendingAutoSync=true;
+    return;
+  }
+  autoSyncInFlight=true;
+  try{
+    setStatus('Kaydediliyor…');
+    const payload={state:normalizeState(state),updatedAt:state.updatedAt||nowIso()};
+    await fetch(SHEETS_URL,{method:'POST',mode:'no-cors',headers:{'Content-Type':'text/plain'},body:JSON.stringify(payload)});
+    setStatus('Senkron tamam');
+  }catch(e){
+    setStatus('Bağlantı yok, yerel kayıt kullanılıyor');
+  }finally{
+    autoSyncInFlight=false;
+    if(pendingAutoSync){
+      pendingAutoSync=false;
+      queueAutoSync();
+    }
+  }
+}
+
+function extractRemoteState(data){
+  if(!data||typeof data!=='object')return null;
+  if(data.state&&typeof data.state==='object')return data.state;
+  if(Array.isArray(data.todo)||Array.isArray(data.reminder)||Array.isArray(data.quick)||Array.isArray(data.notes))return data;
+  return null;
+}
+
+async function syncFromCloud(options={}){
+  const {silent=false}=options;
+  try{
+    if(!silent)setStatus('Yükleniyor…');
+    const res=await fetch(SHEETS_URL+'?t='+Date.now());
+    const data=await res.json();
+    const remote=extractRemoteState(data);
+    if(!remote){
+      if(!silent)setStatus('Senkron tamam');
+      return;
+    }
+    const merged=mergeStates(state,remote);
+    const changed=JSON.stringify(merged)!==JSON.stringify(normalizeState(state));
+    state=merged;
+    saveState();
+    if(changed&&toMs(merged.updatedAt)>toMs((normalizeState(remote)).updatedAt)){
+      queueAutoSync();
+    }
+    if(!silent)setStatus('Senkron tamam');
+  }catch(e){
+    setStatus('Bağlantı yok, yerel kayıt kullanılıyor');
+  }
+}
+
+function exportBackup(){
+  const payload={state:normalizeState(state),exportedAt:nowIso()};
+  const blob=new Blob([JSON.stringify(payload,null,2)],{type:'application/json'});
+  const a=document.createElement('a');
+  a.href=URL.createObjectURL(blob);
+  a.download='not-paneli-yedek.json';
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
 function importBackup(){document.getElementById('backupFile').click()}
-function handleBackupFile(event){const file=event.target.files[0];if(!file)return;const reader=new FileReader();reader.onload=()=>{try{const data=JSON.parse(reader.result);state=data.state||data;saveState();setStatus('Yedek yüklendi. İstersen Sheets’e kaydet.')}catch(e){setStatus('Yedek dosyası okunamadı.')}};reader.readAsText(file);event.target.value=''}
-function renderItem(type,item){return `<div class="item ${item.done?'done':''}"><input type="checkbox" ${item.done?'checked':''} onchange="toggleDone('${type}','${item.id}')"><div><div class="title">${escapeHtml(item.text)}</div><div class="meta"><span class="tag">${escapeHtml(item.meta||'Not')}</span><span>Eklenme: ${escapeHtml(item.createdAt)}</span>${item.doneAt?`<span>Tamamlandı: ${escapeHtml(item.doneAt)}</span>`:''}</div></div><div class="actions"><button onclick="editItem('${type}','${item.id}')">Düzenle</button><button class="danger" onclick="removeItem('${type}','${item.id}')">Sil</button></div></div>`}
-function renderNote(item){return `<div class="item"><div>📌</div><div><div class="title">${escapeHtml(item.text)}</div><div class="meta"><span>Eklenme: ${escapeHtml(item.createdAt)}</span></div></div><div class="actions"><button onclick="editNote('${item.id}')">Düzenle</button><button class="danger" onclick="removeNote('${item.id}')">Sil</button></div></div>`}
-function renderList(type,activeId,doneId){const active=state[type].filter(x=>!x.done);const done=state[type].filter(x=>x.done);document.getElementById(activeId).innerHTML=active.length?active.map(x=>renderItem(type,x)).join(''):'<p class="subtitle">Aktif kayıt yok.</p>';document.getElementById(doneId).innerHTML=done.length?done.map(x=>renderItem(type,x)).join(''):'<p class="subtitle">Tamamlanan kayıt yok.</p>'}
-function render(){renderList('todo','todoList','todoDoneList');renderList('reminder','reminderList','reminderDoneList');renderList('quick','quickList','quickDoneList');document.getElementById('noteList').innerHTML=state.notes.length?state.notes.map(renderNote).join(''):'<p class="subtitle">Sabit not yok.</p>';document.getElementById('todoCount').textContent=state.todo.filter(x=>!x.done).length;document.getElementById('reminderCount').textContent=state.reminder.filter(x=>!x.done).length;document.getElementById('doneCount').textContent=[...state.todo,...state.reminder,...state.quick].filter(x=>x.done).length;document.getElementById('noteCount').textContent=state.notes.length}render();
+
+function handleBackupFile(event){
+  const file=event.target.files[0];
+  if(!file)return;
+  const reader=new FileReader();
+  reader.onload=()=>{
+    try{
+      const data=JSON.parse(reader.result);
+      const incoming=normalizeState(data.state||data);
+      state=mergeStates(state,incoming);
+      saveAndMaybeSync(true);
+      setStatus('Senkron tamam');
+    }catch(e){
+      setStatus('Bağlantı yok, yerel kayıt kullanılıyor');
+    }
+  };
+  reader.readAsText(file);
+  event.target.value='';
+}
+
+function renderItem(type,item){
+  return `<div class="item ${item.done?'done':''}"><input type="checkbox" ${item.done?'checked':''} onchange="toggleDone('${type}','${item.id}')"><div><div class="title">${escapeHtml(item.text)}</div><div class="meta"><span class="tag">${escapeHtml(item.meta||'Not')}</span><span>Eklenme: ${escapeHtml(item.createdAt)}</span>${item.doneAt?`<span>Tamamlandı: ${escapeHtml(item.doneAt)}</span>`:''}</div></div><div class="actions"><button onclick="editItem('${type}','${item.id}')">Düzenle</button><button class="danger" onclick="removeItem('${type}','${item.id}')">Sil</button></div></div>`;
+}
+
+function renderNote(item){
+  return `<div class="item"><div>📌</div><div><div class="title">${escapeHtml(item.text)}</div><div class="meta"><span>Eklenme: ${escapeHtml(item.createdAt)}</span></div></div><div class="actions"><button onclick="editNote('${item.id}')">Düzenle</button><button class="danger" onclick="removeNote('${item.id}')">Sil</button></div></div>`;
+}
+
+function renderList(type,activeId,doneId){
+  const active=state[type].filter(x=>!x.done&&!x.deleted);
+  const done=state[type].filter(x=>x.done&&!x.deleted);
+  document.getElementById(activeId).innerHTML=active.length?active.map(x=>renderItem(type,x)).join(''):'<p class="subtitle">Aktif kayıt yok.</p>';
+  document.getElementById(doneId).innerHTML=done.length?done.map(x=>renderItem(type,x)).join(''):'<p class="subtitle">Tamamlanan kayıt yok.</p>';
+}
+
+function render(){
+  renderList('todo','todoList','todoDoneList');
+  renderList('reminder','reminderList','reminderDoneList');
+  renderList('quick','quickList','quickDoneList');
+  const visibleNotes=state.notes.filter(x=>!x.deleted);
+  document.getElementById('noteList').innerHTML=visibleNotes.length?visibleNotes.map(renderNote).join(''):'<p class="subtitle">Sabit not yok.</p>';
+  document.getElementById('todoCount').textContent=state.todo.filter(x=>!x.done&&!x.deleted).length;
+  document.getElementById('reminderCount').textContent=state.reminder.filter(x=>!x.done&&!x.deleted).length;
+  document.getElementById('doneCount').textContent=[...state.todo,...state.reminder,...state.quick].filter(x=>x.done&&!x.deleted).length;
+  document.getElementById('noteCount').textContent=visibleNotes.length;
+}
+
+function startAutoSync(){
+  syncFromCloud();
+  if(pollTimer)clearInterval(pollTimer);
+  pollTimer=setInterval(()=>syncFromCloud({silent:true}),SYNC_INTERVAL_MS);
+}
+
+window.addEventListener('online',()=>setStatus('Senkron tamam'));
+window.addEventListener('offline',()=>setStatus('Bağlantı yok, yerel kayıt kullanılıyor'));
+
+state=normalizeState(state);
+saveState();
+setStatus('Yükleniyor…');
+startAutoSync();
 </script>
 </body>
 </html>
