@@ -20,7 +20,7 @@ function payload_(){
   var history=[];
   for(var i=1;i<hist.length;i++){
     var r=hist[i]; if(!r[0])continue;
-    history.push({date:date_(r[0],tz),orders:num_(r[2]),mainProducts:num_(r[3]),revenue:num_(r[4]),productCost:num_(r[7]),platformCut:num_(r[8]),vat:num_(r[9]),preFixedProfit:num_(r[10]),fixedCost:num_(r[11]),temporaryNet:num_(r[12]),definiteNet:r[13]===''||r[13]==null?null:num_(r[13]),accumulatedDefinite:num_(r[14]),issue:String(r[15]||''),status:String(r[16]||'')});
+    history.push({date:date_(r[0],tz),orders:num_(r[2]),mainProducts:num_(r[3]),revenue:num_(r[4]),productCost:num_(r[7]),platformCut:num_(r[8]),vat:num_(r[9]),preFixedProfit:num_(r[10]),fixedCost:num_(r[11]),temporaryNet:num_(r[12], null),definiteNet:num_(r[13], null),accumulatedDefinite:num_(r[14]),issue:String(r[15]||''),status:String(r[16]||'')});
   }
   history.sort(function(a,b){return String(a.date).localeCompare(String(b.date));});
   var overview=history.length?history[history.length-1]:{};
@@ -83,7 +83,15 @@ function liveFinance_(rows,todayDate,tz,overview){
   return f;
 }
 function values_(ss,n,w){var s=ss.getSheetByName(n);if(!s)return[];var r=s.getLastRow();return r<1?[]:s.getRange(1,1,r,w).getValues();}
-function num_(v){if(v===''||v==null)return 0;if(typeof v==='number')return isFinite(v)?v:0;var s=String(v).replace(/₺/g,'').replace(/TRY/g,'').replace(/\s/g,'').replace(/\./g,'').replace(',','.').replace('%','');var n=Number(s);return isFinite(n)?n:0;}
+function num_(v, fallback) {
+  if (fallback === undefined) fallback = 0;
+  if (v === '' || v == null) return fallback;
+  if (typeof v === 'number') return isFinite(v) ? v : fallback;
+  var text = String(v).replace(/₺/g, '').replace(/TRY/g, '').replace(/\s/g, '').replace(/\./g, '').replace(',', '.').replace('%', '');
+  if (!text) return fallback;
+  var number = Number(text);
+  return isFinite(number) ? number : fallback;
+}
 function date_(v,tz){if(!v)return'';if(v instanceof Date&&!isNaN(v.getTime()))return Utilities.formatDate(v,tz,'yyyy-MM-dd');var s=String(v).trim(),m=s.match(/^(\d{1,2})\.(\d{1,2})\.(\d{4})/);if(m)return m[3]+'-'+('0'+m[2]).slice(-2)+'-'+('0'+m[1]).slice(-2);m=s.match(/^(\d{4}-\d{2}-\d{2})/);return m?m[1]:'';}
 function dt_(v,tz){if(!v)return'';if(v instanceof Date&&!isNaN(v.getTime()))return Utilities.formatDate(v,tz,"yyyy-MM-dd'T'HH:mm:ssXXX");var d=new Date(v);return isNaN(d.getTime())?String(v):d.toISOString();}
 function time_(v,tz){if(!v)return'';if(v instanceof Date&&!isNaN(v.getTime()))return Utilities.formatDate(v,tz,'HH:mm');var d=new Date(v);return isNaN(d.getTime())?'':Utilities.formatDate(d,tz,'HH:mm');}
